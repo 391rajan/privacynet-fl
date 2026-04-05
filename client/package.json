@@ -1,0 +1,29 @@
+{
+  "name": "privacynet-fl-client",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "PrivacyNet FL — Browser-based federated learning client",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs": "^4.11.0",
+    "dexie": "^3.2.4",
+    "framer-motion": "^12.38.0",
+    "lucide-react": "^1.7.0",
+    "react": "^18.2.0",
+    "react-canvas-draw": "^1.2.1",
+    "react-dom": "^18.2.0",
+    "react-hot-toast": "^2.6.0",
+    "socket.io-client": "^4.7.2"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.37",
+    "@types/react-dom": "^18.2.15",
+    "@vitejs/plugin-react": "^4.2.0",
+    "vite": "^5.0.0"
+  }
+}
