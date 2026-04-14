@@ -65,7 +65,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Analytics stats — totalRounds, currentAccuracy, version
+// Analytics stats — totalRounds, currentAccuracy, version, history, digitAccuracy
 app.get('/api/analytics/stats', async (req, res) => {
   try {
     const latestModel = await GlobalModel.getLatest();
@@ -75,6 +75,35 @@ app.get('/api/analytics/stats', async (req, res) => {
     // Get unique round count by distinct roundNumber values
     const distinctRounds = await TrainingSession.distinct('roundNumber', { status: 'aggregated' }).exec();
 
+    // Fetch model versions for chart history (lightweight — no weights, capped at 50)
+    const allModels = await GlobalModel.find()
+      .select('version accuracy participantCount trainingRound createdAt digitAccuracy')
+      .sort({ version: 1 })
+      .limit(50)
+      .lean()
+      .exec();
+
+    const history = allModels.map(m => ({
+      round: m.trainingRound,
+      globalAccuracy: m.accuracy,
+      participantCount: m.participantCount,
+      version: m.version,
+      timestamp: m.createdAt
+    }));
+
+    // Convert Map to plain object for the latest model's digit accuracy
+    let digitAccuracy = {};
+    if (latestModel && latestModel.digitAccuracy) {
+      // Mongoose Map → plain object
+      if (latestModel.digitAccuracy instanceof Map) {
+        for (const [key, val] of latestModel.digitAccuracy) {
+          digitAccuracy[key] = val;
+        }
+      } else {
+        digitAccuracy = latestModel.digitAccuracy;
+      }
+    }
+
     res.json({
       totalRounds: latestModel ? latestModel.trainingRound : 0,
       currentAccuracy: latestModel ? latestModel.accuracy : 0,
@@ -83,7 +112,9 @@ app.get('/api/analytics/stats', async (req, res) => {
       aggregatedSubmissions: aggregatedSessions,
       uniqueRounds: distinctRounds.length,
       modelCreatedAt: latestModel ? latestModel.createdAt : null,
-      participantCount: latestModel ? latestModel.participantCount : 0
+      participantCount: latestModel ? latestModel.participantCount : 0,
+      history,
+      digitAccuracy
     });
   } catch (err) {
     console.error('[API] Error fetching analytics stats:', err);

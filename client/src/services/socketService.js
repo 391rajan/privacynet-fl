@@ -5,12 +5,14 @@
  * Uses Socket.io-client for WebSocket transport with automatic reconnection.
  * 
  * Events Emitted (client → server):
- *   'join_training'         — Announce this client to the training pool
+ *   'join_training'         — Announce this client with nickname to the training pool
  *   'request_global_model'  — Ask for the latest global model weights
- *   'submit_weights'        — Send locally-trained weight updates
+ *   'submit_weights'        — Send locally-trained weight updates (includes nickname)
+ *   'update_status'         — Notify server of training status change
  * 
  * Events Received (server → client):
  *   'participant_count'     — Number of connected training participants
+ *   'participants_update'   — Full participants list [{nickname, status, joinedAt}]
  *   'model_updated'         — New global model available after aggregation
  *   'aggregation_started'   — Server is beginning aggregation
  *   'aggregation_complete'  — Server finished aggregation with metadata
@@ -24,9 +26,29 @@ class SocketService {
     this.socket = null;
     this.connected = false;
     this.clientId = this._generateClientId();
+    this.nickname = null; // Set via setNickname() before or after connect
     this.callbacks = {};
     this._reconnectAttempts = 0;
     this._maxReconnectAttempts = 10;
+  }
+
+  // ─── Nickname Management ────────────────────────────────────────────────────
+
+  /**
+   * Sets the nickname for this client. Must be called before connect()
+   * or after connect() (will be sent with the next join_training emit).
+   * 
+   * @param {string} nickname
+   */
+  setNickname(nickname) {
+    this.nickname = nickname;
+  }
+
+  /**
+   * @returns {string|null} The current nickname
+   */
+  getNickname() {
+    return this.nickname;
   }
 
   // ─── Connection Management ──────────────────────────────────────────────────
@@ -66,11 +88,12 @@ class SocketService {
         clearTimeout(connectionTimeout); // BUG #8 FIX: Cancel timeout on success
         this.connected = true;
         this._reconnectAttempts = 0;
-        console.log(`[Socket] Connected — id: ${this.socket.id}, clientId: ${this.clientId}`);
+        console.log(`[Socket] Connected — id: ${this.socket.id}, clientId: ${this.clientId}, nickname: ${this.nickname}`);
 
-        // Auto-announce to the training pool
+        // Auto-announce to the training pool (now includes nickname)
         this.socket.emit('join_training', {
           clientId: this.clientId,
+          nickname: this.nickname,
           timestamp: new Date().toISOString()
         });
 
@@ -98,8 +121,10 @@ class SocketService {
       this.socket.on('reconnect', (attemptNumber) => {
         console.log(`[Socket] Reconnected after ${attemptNumber} attempts`);
         this.connected = true;
+        // Re-announce with nickname on reconnection
         this.socket.emit('join_training', {
           clientId: this.clientId,
+          nickname: this.nickname,
           timestamp: new Date().toISOString()
         });
         this._fireCallback('reconnect', { attempts: attemptNumber });
@@ -110,6 +135,12 @@ class SocketService {
       this.socket.on('participant_count', (data) => {
         console.log(`[Socket] Participants: ${data.count}`);
         this._fireCallback('participant_count', data);
+      });
+
+      // NEW: Full participants list with nicknames and statuses
+      this.socket.on('participants_update', (data) => {
+        console.log(`[Socket] Participants update: ${data.length} connected`);
+        this._fireCallback('participants_update', data);
       });
 
       this.socket.on('model_updated', (data) => {
@@ -135,6 +166,11 @@ class SocketService {
       this.socket.on('server_error', (data) => {
         console.error('[Socket] Server error:', data.message);
         this._fireCallback('error', data);
+      });
+
+      // Live activity feed events
+      this.socket.on('feed_event', (data) => {
+        this._fireCallback('feed_event', data);
       });
     });
   }
@@ -165,6 +201,7 @@ class SocketService {
 
   /**
    * Submits locally-trained weights to the server for federated aggregation.
+   * Now includes the nickname in the payload for the activity feed.
    * 
    * @param {Array<{name: string, shape: number[], data: number[]}>} weights
    *   Serialized weight arrays from tensorflowService.extractWeights()
@@ -178,6 +215,7 @@ class SocketService {
 
     const payload = {
       clientId: this.clientId,
+      nickname: this.nickname, // Include nickname for activity feed
       weights,
       localAccuracy,
       samplesUsed: metadata.samplesUsed || 0,
@@ -186,7 +224,19 @@ class SocketService {
     };
 
     this.socket.emit('submit_weights', payload);
-    console.log(`[Socket] Submitted weights — accuracy: ${(localAccuracy * 100).toFixed(1)}%, samples: ${metadata.samplesUsed || '?'}`);
+    console.log(`[Socket] Submitted weights — nickname: ${this.nickname}, accuracy: ${(localAccuracy * 100).toFixed(1)}%, samples: ${metadata.samplesUsed || '?'}`);
+  }
+
+  // ─── Status Updates ───────────────────────────────────────────────────────────
+
+  /**
+   * Notifies the server of a training status change.
+   * 
+   * @param {'waiting' | 'training' | 'submitted'} status
+   */
+  updateStatus(status) {
+    if (!this._ensureConnected()) return;
+    this.socket.emit('update_status', { status });
   }
 
   // ─── Event Subscriptions ──────────────────────────────────────────────────────
@@ -197,6 +247,14 @@ class SocketService {
    */
   onParticipantCount(callback) {
     this.callbacks['participant_count'] = callback;
+  }
+
+  /**
+   * Register a callback for the full participants list update.
+   * @param {Function} callback - Receives [{nickname, status, joinedAt}]
+   */
+  onParticipantsUpdate(callback) {
+    this.callbacks['participants_update'] = callback;
   }
 
   /**
@@ -245,6 +303,14 @@ class SocketService {
    */
   onWeightReceived(callback) {
     this.callbacks['weight_received'] = callback;
+  }
+
+  /**
+   * Register a callback for live activity feed events.
+   * @param {Function} callback - Receives { id, type, nickname, timestamp, data }
+   */
+  onFeedEvent(callback) {
+    this.callbacks['feed_event'] = callback;
   }
 
   // ─── Disconnect ───────────────────────────────────────────────────────────────

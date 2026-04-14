@@ -4,10 +4,16 @@
  * WebSocket event handlers for the federated learning protocol.
  * 
  * Protocol Flow:
- *   1. Client connects → 'join_training' → server tracks participant
+ *   1. Client connects → 'join_training' → server tracks participant with nickname
  *   2. Client requests model → 'request_global_model' → server sends weights
  *   3. Client trains locally, then → 'submit_weights' → server buffers update
  *   4. When enough clients submit → server runs FedAvg → 'model_updated' broadcast
+ * 
+ * Nickname System:
+ *   - Each client sends { nickname } with join_training
+ *   - Server stores in connectedClients Map: socketId → { nickname, joinedAt, status }
+ *   - On join/leave/submit, broadcasts 'participants_update' with full participant list
+ *   - Status values: "waiting" | "training" | "submitted"
  * 
  * The aggregation threshold (MIN_CLIENTS_FOR_AGGREGATION) is configurable.
  * Default is 2 — set higher in production for better privacy guarantees.
@@ -17,11 +23,16 @@ const { federatedAverage, validateClientWeights } = require('../services/federat
 const modelManager = require('../services/modelManager');
 const TrainingSession = require('../models/TrainingSession');
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 
 // ─── State ──────────────────────────────────────────────────────────────────────
 
 // In-memory buffer of weight submissions for the current aggregation round
 const pendingSubmissions = new Map(); // clientId → { weights, accuracy, samplesUsed, socketId }
+
+// Connected clients with nickname metadata
+// socketId → { nickname, clientId, joinedAt, status, hasSubmitted, localAccuracy }
+const connectedClients = new Map();
 
 let currentRound = 0;
 let participantCount = 0;
@@ -29,6 +40,65 @@ let isAggregating = false; // BUG #5 FIX: Mutex to prevent concurrent aggregatio
 
 // Aggregation triggers when this many clients have submitted
 const MIN_CLIENTS = parseInt(process.env.MIN_CLIENTS_FOR_AGGREGATION || '2', 10);
+
+// ─── Helpers ────────────────────────────────────────────────────────────────────
+
+/**
+ * Builds the participants list array for broadcasting.
+ * Maps the connectedClients Map to a clean payload for all clients.
+ * 
+ * @returns {Array<{nickname: string, status: string, joinedAt: number}>}
+ */
+function getParticipantsList() {
+  const list = [];
+  for (const [, client] of connectedClients) {
+    list.push({
+      nickname: client.nickname,
+      status: client.status,
+      joinedAt: client.joinedAt
+    });
+  }
+  return list;
+}
+
+/**
+ * Broadcasts the current participants list to all connected clients.
+ * Called on: join, disconnect, status change (submit weights).
+ * 
+ * @param {import('socket.io').Server} io
+ */
+function broadcastParticipants(io) {
+  const participants = getParticipantsList();
+  io.emit('participants_update', participants);
+  io.emit('participant_count', { count: participants.length });
+}
+
+/**
+ * Broadcasts a structured feed event to ALL connected clients.
+ * Each event has a unique ID, type, optional nickname, timestamp, and data payload.
+ * 
+ * @param {import('socket.io').Server} io
+ * @param {string} type - One of: USER_JOINED, USER_LEFT, TRAINING_STARTED, WEIGHTS_SUBMITTED,
+ *                        AGGREGATION_STARTED, MODEL_UPDATED, ROUND_COMPLETE
+ * @param {Object} data - Event-specific data (nickname, accuracy, version, etc.)
+ */
+function broadcastFeedEvent(io, type, data = {}) {
+  const event = {
+    id: crypto.randomUUID(),
+    type,
+    nickname: data.nickname || 'Anonymous',
+    timestamp: Date.now(),
+    data: {
+      accuracy: data.accuracy ?? null,
+      version: data.version ?? null,
+      round: data.round ?? null,
+      participantCount: data.participantCount ?? null,
+      contributorCount: data.contributorCount ?? null
+    }
+  };
+  io.emit('feed_event', event);
+  console.log(`[Feed] ${type}${data.nickname ? ` — ${data.nickname}` : ''}`);
+}
 
 // ─── Setup ──────────────────────────────────────────────────────────────────────
 
@@ -43,17 +113,27 @@ function setupTrainingSocket(io) {
     participantCount++;
     console.log(`[Socket] Client connected: ${socket.id} (Total: ${participantCount})`);
 
-    // Broadcast updated participant count to ALL clients
-    io.emit('participant_count', { count: participantCount });
-
     // ── join_training ─────────────────────────────────────────────────────────
 
     socket.on('join_training', (data) => {
       const clientId = data?.clientId || socket.id;
-      console.log(`[Socket] Client joined training: ${clientId}`);
+      const nickname = data?.nickname || `User_${socket.id.slice(0, 6)}`;
+
+      console.log(`[Socket] Client joined training: ${nickname} (${clientId})`);
 
       // Store metadata on the socket for later reference
       socket.clientId = clientId;
+      socket.nickname = nickname;
+
+      // Register in connectedClients map with full metadata
+      connectedClients.set(socket.id, {
+        nickname,
+        clientId,
+        joinedAt: Date.now(),
+        status: 'waiting',     // Starts as "waiting" — not yet trained
+        hasSubmitted: false,
+        localAccuracy: null
+      });
 
       // Send current state to the newly joined client
       socket.emit('training_state', {
@@ -62,6 +142,12 @@ function setupTrainingSocket(io) {
         pendingSubmissions: pendingSubmissions.size,
         minClientsRequired: MIN_CLIENTS
       });
+
+      // Broadcast updated participant list to ALL clients
+      broadcastParticipants(io);
+
+      // Feed event: user joined
+      broadcastFeedEvent(io, 'USER_JOINED', { nickname });
     });
 
     // ── request_global_model ──────────────────────────────────────────────────
@@ -84,10 +170,30 @@ function setupTrainingSocket(io) {
           trainingRound: model.trainingRound
         });
 
-        console.log(`[Socket] Sent global model v${model.version} to ${socket.clientId || socket.id}`);
+        console.log(`[Socket] Sent global model v${model.version} to ${socket.nickname || socket.clientId || socket.id}`);
       } catch (err) {
         console.error('[Socket] Error fetching global model:', err);
         socket.emit('server_error', { message: 'Failed to retrieve global model' });
+      }
+    });
+
+    // ── update_status ─────────────────────────────────────────────────────────
+    // Client can explicitly update their status (e.g., when they start training)
+
+    socket.on('update_status', (data) => {
+      const client = connectedClients.get(socket.id);
+      if (client && data?.status) {
+        const validStatuses = ['waiting', 'training', 'submitted'];
+        if (validStatuses.includes(data.status)) {
+          client.status = data.status;
+          console.log(`[Socket] ${client.nickname} status → ${data.status}`);
+          broadcastParticipants(io);
+
+          // Feed event: training started
+          if (data.status === 'training') {
+            broadcastFeedEvent(io, 'TRAINING_STARTED', { nickname: client.nickname });
+          }
+        }
       }
     });
 
@@ -95,14 +201,15 @@ function setupTrainingSocket(io) {
 
     socket.on('submit_weights', async (data) => {
       const clientId = data?.clientId || socket.clientId || socket.id;
+      const nickname = data?.nickname || socket.nickname || clientId;
 
       try {
-        console.log(`[Socket] Received weights from ${clientId}`);
+        console.log(`[Socket] Received weights from ${nickname} (${clientId})`);
 
         // Validate incoming weights
         const validation = validateClientWeights(data.weights);
         if (!validation.valid) {
-          console.warn(`[Socket] Rejected weights from ${clientId}: ${validation.reason}`);
+          console.warn(`[Socket] Rejected weights from ${nickname}: ${validation.reason}`);
           socket.emit('server_error', {
             message: `Weight submission rejected: ${validation.reason}`
           });
@@ -115,8 +222,17 @@ function setupTrainingSocket(io) {
           accuracy: data.localAccuracy || 0,
           samplesUsed: data.samplesUsed || 0,
           socketId: socket.id,
+          nickname,
           timestamp: new Date()
         });
+
+        // Update the client's status to "submitted" in the participants list
+        const client = connectedClients.get(socket.id);
+        if (client) {
+          client.status = 'submitted';
+          client.hasSubmitted = true;
+          client.localAccuracy = data.localAccuracy || null;
+        }
 
         // Persist to MongoDB for audit trail
         const session = new TrainingSession({
@@ -143,11 +259,18 @@ function setupTrainingSocket(io) {
           threshold: MIN_CLIENTS
         });
 
-        // Broadcast progress to all clients
+        // Broadcast progress to all clients (including updated participant statuses)
         io.emit('submission_progress', {
           currentSubmissions: pendingSubmissions.size,
           requiredSubmissions: MIN_CLIENTS,
           round: currentRound
+        });
+        broadcastParticipants(io);
+
+        // Feed event: weights submitted
+        broadcastFeedEvent(io, 'WEIGHTS_SUBMITTED', {
+          nickname,
+          accuracy: data.localAccuracy || 0
         });
 
         console.log(`[Socket] Pending submissions: ${pendingSubmissions.size}/${MIN_CLIENTS}`);
@@ -165,7 +288,7 @@ function setupTrainingSocket(io) {
         }
 
       } catch (err) {
-        console.error(`[Socket] Error processing weights from ${clientId}:`, err);
+        console.error(`[Socket] Error processing weights from ${nickname}:`, err);
         socket.emit('server_error', { message: 'Failed to process weight submission' });
       }
     });
@@ -174,7 +297,20 @@ function setupTrainingSocket(io) {
 
     socket.on('disconnect', (reason) => {
       participantCount = Math.max(0, participantCount - 1);
-      console.log(`[Socket] Client disconnected: ${socket.clientId || socket.id} — reason: ${reason} (Total: ${participantCount})`);
+      
+      // Get nickname for logging before removing from map
+      const client = connectedClients.get(socket.id);
+      const displayName = client?.nickname || socket.clientId || socket.id;
+
+      console.log(`[Socket] Client disconnected: ${displayName} — reason: ${reason} (Total: ${participantCount})`);
+
+      // Feed event: user left (only if they had actually joined with a nickname)
+      if (client?.nickname) {
+        broadcastFeedEvent(io, 'USER_LEFT', { nickname: client.nickname });
+      }
+
+      // Remove from connectedClients map
+      connectedClients.delete(socket.id);
 
       // BUG #10 FIX: Remove pending submissions robustly.
       // socket.clientId is only set if the client sent 'join_training' first.
@@ -190,8 +326,8 @@ function setupTrainingSocket(io) {
         }
       }
 
-      // Broadcast updated count
-      io.emit('participant_count', { count: participantCount });
+      // Broadcast updated participant list
+      broadcastParticipants(io);
     });
   });
 
@@ -217,6 +353,12 @@ async function performAggregation(io) {
   io.emit('aggregation_started', {
     round: currentRound + 1,
     contributorCount: pendingSubmissions.size
+  });
+
+  // Feed event: aggregation started
+  broadcastFeedEvent(io, 'AGGREGATION_STARTED', {
+    contributorCount: pendingSubmissions.size,
+    round: currentRound + 1
   });
 
   try {
@@ -276,8 +418,25 @@ async function performAggregation(io) {
       durationMs
     });
 
+    // Feed events: model updated + round complete
+    broadcastFeedEvent(io, 'MODEL_UPDATED', {
+      version,
+      accuracy: avgAccuracy
+    });
+    broadcastFeedEvent(io, 'ROUND_COMPLETE', {
+      round: currentRound,
+      participantCount: contributorIds.length
+    });
+
     // Clear pending buffer for next round
     pendingSubmissions.clear();
+
+    // Reset all client statuses to "waiting" for the next round
+    for (const [, client] of connectedClients) {
+      client.status = 'waiting';
+      client.hasSubmitted = false;
+    }
+    broadcastParticipants(io);
 
     console.log(`[FedAvg] Round ${currentRound} complete — version ${version}, avg accuracy ${(avgAccuracy * 100).toFixed(1)}%, took ${durationMs}ms`);
     console.log(`[FedAvg] ═══════════════════════════════════════════════════\n`);

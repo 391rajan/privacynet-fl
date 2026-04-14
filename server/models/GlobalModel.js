@@ -43,6 +43,13 @@ const GlobalModelSchema = new mongoose.Schema({
   createdAt: {
     type: Date,
     default: Date.now
+  },
+
+  // Per-digit accuracy breakdown (keys: "0" through "9", values: 0-1)
+  digitAccuracy: {
+    type: Map,
+    of: Number,
+    default: {}
   }
 });
 

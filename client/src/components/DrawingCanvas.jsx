@@ -1,5 +1,4 @@
-import React, { useRef, useState } from 'react';
-import CanvasDraw from 'react-canvas-draw';
+import React, { useRef, useState, Component } from 'react';
 import { Trash2, Save, ChevronDown, CheckCircle } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
@@ -8,6 +7,48 @@ const cardVariants = {
   hidden: { opacity: 0, y: 24 },
   show: { opacity: 1, y: 0, transition: { duration: 0.5, ease: "easeOut" } }
 };
+
+// ─── Error Boundary ─────────────────────────────────────────────────────────────
+// react-canvas-draw requires React 16/17 peer deps. Under React 18 StrictMode
+// it can throw during mount. This boundary catches the error gracefully.
+class CanvasErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+  componentDidCatch(error, info) {
+    console.warn('[DrawingCanvas] react-canvas-draw error caught:', error.message);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex flex-col items-center justify-center w-full aspect-square bg-slate-50 rounded-lg border-2 border-dashed border-slate-200 text-center p-6">
+          <p className="text-sm font-medium text-slate-500 mb-2">Canvas unavailable</p>
+          <p className="text-xs text-slate-400">Drawing component failed to load. Try refreshing.</p>
+          <button 
+            onClick={() => this.setState({ hasError: false })}
+            className="mt-3 text-xs text-blue-500 hover:underline font-medium"
+          >
+            Retry
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// ─── Lazy-load react-canvas-draw ────────────────────────────────────────────────
+// Dynamically import to prevent build errors if the package has issues
+let CanvasDraw = null;
+try {
+  CanvasDraw = require('react-canvas-draw').default || require('react-canvas-draw');
+} catch (err) {
+  console.warn('[DrawingCanvas] react-canvas-draw not available:', err.message);
+}
 
 export function DrawingCanvas({ onSaveDrawing }) {
   const canvasRef = useRef(null);
@@ -42,7 +83,7 @@ export function DrawingCanvas({ onSaveDrawing }) {
       });
     }
 
-    toast.success(`Drawing saved manually!`, {
+    toast.success(`Drawing saved!`, {
       icon: <CheckCircle className="text-emerald-500" />,
       style: { background: '#1E293B', color: '#fff' }
     });
@@ -83,21 +124,29 @@ export function DrawingCanvas({ onSaveDrawing }) {
       </div>
 
       <div className="flex flex-col items-center">
-        <div className="relative rounded-lg border border-slate-200 overflow-hidden cursor-crosshair min-w-[240px] max-w-[280px] w-full aspect-square bg-white shadow-inner">
-          <CanvasDraw
-            ref={canvasRef}
-            brushColor="#1E293B"
-            brushRadius={3}
-            lazyRadius={0}
-            canvasWidth="100%"
-            canvasHeight="100%"
-            hideGrid={true}
-            backgroundColor="#FFFFFF"
-            onChange={() => {
-              if(!hasStrokes) setHasStrokes(true);
-            }}
-            className="touch-none w-full h-full"
-          />
+        <div className="relative rounded-lg border border-slate-200 overflow-hidden cursor-crosshair bg-white shadow-inner" style={{ width: 280, height: 280 }}>
+          <CanvasErrorBoundary>
+            {CanvasDraw ? (
+              <CanvasDraw
+                ref={canvasRef}
+                brushColor="#1E293B"
+                brushRadius={3}
+                lazyRadius={0}
+                canvasWidth={280}
+                canvasHeight={280}
+                hideGrid={true}
+                backgroundColor="#FFFFFF"
+                onChange={() => {
+                  if(!hasStrokes) setHasStrokes(true);
+                }}
+                className="touch-none"
+              />
+            ) : (
+              <div className="w-full h-full flex items-center justify-center text-sm text-slate-400">
+                Canvas not available
+              </div>
+            )}
+          </CanvasErrorBoundary>
         </div>
 
         <div className="w-full flex items-center justify-between gap-4 mt-6">
